@@ -1,0 +1,132 @@
+from pymongo import MongoClient
+from langchain_mongodb import MongoDBAtlasVectorSearch
+from langchain_google_genai import GoogleGenerativeAIEmbeddings
+from langchain_groq import ChatGroq
+from langchain_core.prompts import PromptTemplate
+from pydantic import BaseModel
+from dotenv import load_dotenv, find_dotenv
+import pandas as pd
+import json
+import os
+
+# Load environment variables
+load_dotenv(find_dotenv())
+
+# MongoDB & API Keys
+MONGO_URI = os.getenv("MONGO_URI")  # Format: mongodb+srv://user:password@cluster.mongodb.net/
+MONGO_DB = "Superset"
+MONGO_COLLECTION = "csv_embeddings"
+GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY")
+
+# Initialize LLM and Embeddings
+llm_model = ChatGroq(model="llama-3.3-70b-versatile")
+embedding_model = GoogleGenerativeAIEmbeddings(model="models/embedding-001", google_api_key=GOOGLE_API_KEY)
+
+# Connect to MongoDB
+client = MongoClient(MONGO_URI)
+db = client[MONGO_DB]
+collection = db[MONGO_COLLECTION]
+
+# Ensure MongoDB Index for Vector Search
+def setup_mongodb_index():
+    collection.create_index([("embedding", "2dsphere")])  # Ensure MongoDB supports vector retrieval
+    print("✅ MongoDB Vector Index Created!")
+
+# Process CSV and Store Data in MongoDB
+def process_csv_and_store_embeddings(csv_path):
+    df = pd.read_csv(csv_path)
+    documents = []  # Store documents to insert in bulk
+
+    for _, row in df.iterrows():
+        # Convert row values to strings and remove NaN values
+        row_text = " | ".join([f"{col}: {str(value)}" for col, value in row.items() if pd.notna(value)])
+
+        # Generate embedding for the text
+        embedding = embedding_model.embed_query(row_text)
+
+        # Ensure embedding is stored as a list
+        if isinstance(embedding, dict):  # Handle possible dict output
+            embedding = list(embedding.values())
+        elif isinstance(embedding, str):  # Handle possible string output
+            embedding = json.loads(embedding)  # Convert string to list
+
+        document = {
+            "text": row_text,
+            "embedding": embedding  # Ensure embedding is stored as an array
+        }
+        documents.append(document)
+
+    # Insert into MongoDB in bulk
+    if documents:
+        collection.insert_many(documents)
+        print("✅ CSV Data Processed and Stored in MongoDB")
+
+# Setup MongoDB Vector Search
+def setup_mongodb_retriever():
+    return MongoDBAtlasVectorSearch(
+        mongo_uri=MONGO_URI,
+        db_name=MONGO_DB,
+        collection_name=MONGO_COLLECTION,
+        embedding_function=embedding_model,
+        similarity_search_kwargs={"k": 5},
+    ).as_retriever()
+
+# Define Retrieval State Schema
+class RetrievalState(BaseModel):
+    query: str
+    context: str = None
+    response: str = None
+
+# Retrieve Documents from MongoDB
+def retrieve_documents(query):
+    query_embedding = embedding_model.embed_query(query)  # Convert query to embedding
+
+    # Perform vector similarity search
+    results = collection.aggregate([
+        {
+            "$vectorSearch": {
+                "queryVector": query_embedding,
+                "path": "embedding",
+                "numCandidates": 10,
+                "limit": 5
+            }
+        }
+    ])
+
+    # Extract context
+    context = "\n".join([doc["text"] for doc in results]) if results else None
+    return context
+
+# Generate Response Using LLM
+def generate_response(query, context):
+    if context:
+        response = llm_model.invoke(
+            f"Answer the following question based on the provided context.\n\nContext: {context}\n\nQuestion: {query}"
+        )
+    else:
+        response = "The answer is not available in the database."
+
+    return response
+
+# Initialize Database and Store CSV Data
+setup_mongodb_index()
+csv_file_path = "data/inventory.csv"  # Replace with actual CSV file
+process_csv_and_store_embeddings(csv_file_path)
+
+# Setup Retriever
+retriever = setup_mongodb_retriever()
+
+# **Run Query Processing Loop**
+while True:
+    user_query = input("\n🔍 Write Query Here: ")
+    if user_query.lower() in ["exit", "quit"]:
+        break
+
+    # Step 1: Retrieve Documents
+    retrieved_context = retrieve_documents(user_query)
+
+    # Step 2: Generate Response
+    response = generate_response(user_query, retrieved_context)
+
+    # Step 3: Display Response
+    print("\n📝 RESULT:", response)
