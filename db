@@ -1,0 +1,127 @@
+from pymongo import MongoClient
+from langchain_mongodb import MongoDBAtlasVectorSearch
+from langchain_google_genai import GoogleGenerativeAIEmbeddings
+from langgraph.graph import StateGraph
+from langgraph.checkpoint.sqlite import SqliteSaver
+from langchain_groq import ChatGroq
+from langchain_core.prompts import PromptTemplate
+from langchain_core.pydantic_v1 import BaseModel
+from dotenv import load_dotenv, find_dotenv
+import pandas as pd
+import os
+
+# Load environment variables
+load_dotenv(find_dotenv())
+
+MONGO_URI = os.getenv("MONGO_URI")  # Format: mongodb+srv://user:password@cluster.mongodb.net/
+MONGO_DB = "Superset"
+MONGO_COLLECTION = "csv_embeddings"
+GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY")
+
+# Initialize LLM and Embeddings
+llm_model = ChatGroq(model="llama-3.3-70b-versatile")
+embedding_model = GoogleGenerativeAIEmbeddings(model="models/embedding-001", google_api_key=GOOGLE_API_KEY)
+
+# Connect to MongoDB
+client = MongoClient(MONGO_URI)
+db = client[MONGO_DB]
+collection = db[MONGO_COLLECTION]
+
+
+# Ensure MongoDB Index for Vector Search
+def setup_mongodb_index():
+    collection.create_index([("embedding", "2dsphere")])  # Ensure MongoDB supports vector retrieval
+    print("MongoDB Vector Index Created!")
+
+
+# Process CSV and Store Data in MongoDB
+def process_csv_and_store_embeddings(csv_path):
+    df = pd.read_csv(csv_path)
+
+    for _, row in df.iterrows():
+        row_text = " ".join([str(value) for value in row.values])  # Convert row to text
+        embedding = embedding_model.embed_query(row_text)  # Generate embedding
+
+        collection.insert_one({"text": row_text, "embedding": embedding})
+
+    print("CSV Data Processed and Stored in MongoDB")
+
+
+# Setup MongoDB Vector Search
+def setup_mongodb_retriever():
+    return MongoDBAtlasVectorSearch(
+        mongo_uri=MONGO_URI,
+        db_name=MONGO_DB,
+        collection_name=MONGO_COLLECTION,
+        embedding_function=embedding_model,
+        similarity_search_kwargs={"k": 5},
+    ).as_retriever()
+
+
+# **🔹 Step 1: Define the State Schema**
+class RetrievalState(BaseModel):
+    query: str
+    context: str = None
+    response: str = None
+
+
+# **🔹 Step 2: Retrieve Documents from MongoDB**
+def retrieve_documents(state: RetrievalState):
+    query = state.query
+    query_embedding = embedding_model.embed_query(query)  # Convert query to embedding
+
+    results = collection.find().sort(
+        [("embedding", {"$meta": "vectorSearch", "vector": query_embedding})]
+    ).limit(5)
+
+    context = "\n".join([doc["text"] for doc in results]) if results else None
+    return RetrievalState(query=query, context=context)
+
+
+# **🔹 Step 3: Generate Response Using LLM**
+def generate_response(state: RetrievalState):
+    if state.context:
+        response = llm_model.invoke(
+            f"Answer the following question based on the provided context.\n\nContext: {state.context}\n\nQuestion: {state.query}"
+        )
+    else:
+        response = "The answer is not available in the database."
+
+    return RetrievalState(query=state.query, context=state.context, response=response)
+
+
+# **🔹 Step 4: Display Response**
+def display_response(state: RetrievalState):
+    print("\nRESULT:", state.response)
+    return state
+
+
+# **🔹 Step 5: Define LangGraph Workflow**
+store = SqliteSaver("retrieval_state.db")
+graph = StateGraph(RetrievalState)  # 🔥 FIXED: Added state schema!
+
+graph.add_node("retrieve_docs", retrieve_documents)
+graph.add_node("generate_response", generate_response)
+graph.add_node("display_response", display_response)
+
+graph.set_entry_point("retrieve_docs")
+graph.add_edge("retrieve_docs", "generate_response")
+graph.add_edge("generate_response", "display_response")
+
+retrieval_graph = graph.compile(checkpointer=store)
+
+# Initialize Database and Store CSV Data
+setup_mongodb_index()
+csv_file_path = "data/inventory.csv"  # Replace with actual CSV file
+process_csv_and_store_embeddings(csv_file_path)
+
+# Setup Retriever
+retriever = setup_mongodb_retriever()
+
+# **Run Query Processing Loop**
+while True:
+    user_query = input("Write Query Here: ")
+    if user_query.lower() in ["exit", "quit"]:
+        break
+
+    retrieval_graph.invoke({"query": user_query})
